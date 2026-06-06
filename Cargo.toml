@@ -1,0 +1,7 @@
+[package]
+name = "oxide-slotmap"
+version = "0.1.0"
+edition = "2021"
+description = "Slot-based GPU resource allocation with ternary status. {+1=allocated, 0=reserved, -1=free}. Generational indices, bulk alloc, defragmentation."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/oxide-slotmap"

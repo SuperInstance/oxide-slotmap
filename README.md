@@ -1,92 +1,121 @@
 # oxide-slotmap
 
-Slot-based GPU resource allocation with ternary status. {+1=allocated, 0=reserved, -1=free}. Generational indices, bulk alloc, defragmentation.
+> Ternary-state GPU resource allocation with generational safety and defragmentation.
 
-## Why This Matters
+## Background Theory
 
-# oxide-slotmap
-Slot-based GPU resource allocation with ternary status.
+GPU resource allocation is usually framed as a binary problem: a region of memory is either allocated or free. But in a heterogeneous, multi-tenant GPU fleet, that binary model hides important transitional states. A kernel may reserve memory before it is fully committed. A slot may be held for a preflight check. A region may be allocated to one owner but pending migration to another.
 
-## The Five-Layer Stack
+`oxide-slotmap` introduces a **ternary state model**:
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+- `Allocated = +1` — The slot is owned and in use.
+- `Reserved = 0` — The slot is held but not yet active.
+- `Free = -1` — The slot is available for allocation.
 
-```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
-```
+This ternary model maps naturally onto the SuperInstance worldview, where `{-1, 0, +1}` represents not just numeric values but qualitative states: absent, potential, actual.
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+A second theoretical commitment is **generational safety**. SlotMap keys carry a generation counter. When a slot is deallocated, its generation increments, invalidating any stale keys held elsewhere. This prevents the classic use-after-free bug in resource allocators without requiring centralized reference counting.
 
-## Design
+## How It Works
 
-Every value in this crate follows **ternary algebra** (Z₃):
+`oxide-slotmap` centers on `OxideSlotMap`, a fixed-capacity allocator backed by:
 
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
+- A `Vec<Slot>` storing state, generation, and owner for each slot.
+- A `free_list` stack tracking indices available for allocation.
 
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
+### Allocation Path
 
-## Key Types
+1. Pop an index from `free_list`.
+2. Set the slot's state to `Allocated` (or `Reserved` for `reserve()`).
+3. Record the owner.
+4. Return a `SlotKey { index, generation }`.
 
-```rust
-pub enum SlotState
-pub struct SlotKey
-pub struct OxideSlotMap
-pub fn new
-pub fn allocate
-pub fn reserve
-pub fn deallocate
-pub fn get_state
-pub fn get_owner
-pub fn bulk_allocate
-pub fn defragment
-pub fn allocated_count
-```
+### Deallocation Path
 
-## Usage
+1. Validate that the key's generation matches the slot.
+2. Validate that the slot is not already `Free`.
+3. Increment generation, set state to `Free`, clear owner.
+4. Push index back onto `free_list`.
 
-```toml
-[dependencies]
-oxide-slotmap = "0.1.0"
-```
+### Defragmentation
+
+Over time, allocate/free cycles create holes. `defragment()` compacts live slots to the front of the backing vector and rebuilds the free list from the remaining capacity. It returns the number of slots moved, giving callers a measurable fragmentation cost.
+
+### Bulk Operations
+
+`bulk_allocate(owner, count)` efficiently reserves many slots for workloads that know their resource needs upfront — a common case when reserving GPU tensor regions for a batched inference job.
+
+## Experiments
+
+The test suite encodes the following claims:
 
 ```rust
-use oxide_slotmap::*;
-// See src/lib.rs tests for complete working examples
+#[test]
+fn test_generation_mismatch() {
+    // Stale keys return None, proving generational safety.
+}
+
+#[test]
+fn test_defragment() {
+    // After fragmentation, compaction moves live slots to the front
+    // and restores the free list.
+}
+
+#[test]
+fn test_exhaustion() {
+    // Allocation returns None when capacity is saturated.
+}
 ```
 
-## Testing
+A larger experiment: simulate a 10,000-slot allocator under a random walk of allocate/free operations. Measure:
 
-```bash
-git clone https://github.com/SuperInstance/oxide-slotmap.git
-cd oxide-slotmap
-cargo test    # 8 tests
+- Average allocation latency (expected O(1)).
+- Fragmentation ratio over time.
+- Defragmentation cost vs. live slot count.
+- Generation collision probability over 1 billion operations.
+
+## Applications
+
+- **GPU tensor region tracking**: Map logical tensor slots to GPU memory without leaking regions across kernel boundaries.
+- **Multi-tenant GPU sharing**: Allocate/reserve slots for different workloads before they are scheduled.
+- **Construct caching**: `oxide-constructs` can use slot keys to track which compiled kernels are resident on which GPUs.
+- **Batch inference reservations**: Reserve slots for a batch, activate them (`Reserved → Allocated`) when inputs arrive, and free atomically when outputs are returned.
+- **Fleet resource accounting**: Aggregate slot counts across agents in `oxide-fleet` to produce fleet-wide availability metrics.
+
+## Open Questions
+
+1. **Capacity resizing**: Should `OxideSlotMap` support dynamic capacity growth, or is fixed capacity a feature that forces explicit capacity planning?
+2. **Reservation timeouts**: Reserved slots can be held indefinitely. Should the map enforce reservation TTLs to prevent silent resource starvation?
+3. **NUMA-aware allocation**: On multi-GPU nodes, should slot indices encode locality hints, or should locality be handled by a higher layer?
+4. **Generational width**: A 32-bit generation is effectively unbounded, but do embedded GPU controllers need smaller key encodings?
+
+## Cross-Links
+
+- [SuperInstance agent-knowledge / TERNARY-NUMBERS.md](https://github.com/SuperInstance/agent-knowledge/blob/main/TERNARY-NUMBERS.md) — The ternary philosophy underlying `Allocated/Reserved/Free`.
+- [SuperInstance agent-knowledge / CONSERVATION-LAWS.md](https://github.com/SuperInstance/agent-knowledge/blob/main/CONSERVATION-LAWS.md) — Conservation of allocated + reserved + free = capacity.
+- [SuperInstance agent-knowledge / GPU-AS-MOTOR-CORTEX.md](https://github.com/SuperInstance/agent-knowledge/blob/main/GPU-AS-MOTOR-CORTEX.md) — Why fine-grained GPU resource tracking matters.
+- `oxide-fleet` — Uses slot counts in workload metrics and resource discovery.
+- `oxide-constructs` — Tracks compiled construct PTX in GPU memory slots.
+
+## Quick Start
+
+```rust
+use oxide_slotmap::{OxideSlotMap, SlotState};
+
+let mut sm = OxideSlotMap::new(1024);
+
+let key = sm.allocate("attention-kernel-42").unwrap();
+assert_eq!(sm.get_state(key), Some(SlotState::Allocated));
+assert_eq!(sm.get_owner(key), Some("attention-kernel-42"));
+
+let reserved = sm.reserve("preflight-check").unwrap();
+assert_eq!(sm.get_state(reserved), Some(SlotState::Reserved));
+
+// Generational safety: deallocating invalidates the key.
+sm.deallocate(key);
+assert_eq!(sm.get_state(key), None);
+
+// Compact live slots after fragmentation.
+let moved = sm.defragment();
+println!("Defragmentation moved {} slots", moved);
 ```
-
-## Stats
-
-| Metric | Value |
-|--------|-------|
-| Tests | 8 |
-| Lines of Rust | 183 |
-| Public API | 15 items |
-
-## License
-
-Apache-2.0
